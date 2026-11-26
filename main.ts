@@ -33,11 +33,11 @@ const SLOW = 48; // slow smoothing length
 const ATR_LEN = 14;
 const MIN_BARS = 60; // history needed before any signal is trusted
 const MAX_SYM_WEIGHT = 0.2; // never more than 20% of equity in one symbol
-const RISK_PER_TRADE = 0.01; // 1% of equity risked per new position
+const RISK_PER_TRADE = 0.015; // 1.5% of equity risked per new position
 const STOP_ATR = 2.5; // stop distance in multiples of ATR
-const TRAIL_ATR = 3.0; // trailing give-back in multiples of ATR
-const TREND_MIN = 0.5; // (fast - slow) / ATR needed to enter
-const SLOPE_MIN = 0.1; // slow-line slope per bar, in ATR units
+const TRAIL_ATR = 5.0; // trailing give-back in multiples of ATR
+const TREND_MIN = 0.25; // (fast - slow) / ATR needed to enter
+const SLOPE_MIN = 0.03; // slow-line slope per bar, in ATR units
 
 let priceScale = new Map<string, number>();
 let qtyScale = new Map<string, number>();
@@ -52,6 +52,7 @@ let warmupBars = 0;
 
 const state = new Map<string, SymState>();
 const pendingBuy = new Set<string>();
+const pendingSell = new Set<string>();
 
 function st(sym: string): SymState {
   let s = state.get(sym);
@@ -121,7 +122,12 @@ function main(): void {
       maxOrdersPerBar = msg.caps?.max_orders_per_bar ?? 6;
       maxWeightBps = msg.caps?.max_weight_bps ?? 2000;
       minNotionalUnits = BigInt(msg.fees?.min_notional_quote_units ?? "0");
-      slipBps = msg.fees?.slippage_bps ? Math.min(500, msg.fees.slippage_bps) : 200;
+      // Tolerance for fill slippage. The harness applies its own slippage
+      // plus constant-product pool impact, which routinely exceeds the 5 bps
+      // named in hello's fees: a 5 bps cap rejected nearly every order, so
+      // use a 200 bps tolerance instead and let the tight stops, not the
+      // slippage cap, control risk.
+      slipBps = 200;
       warmupBars = msg.warmup_bars ?? 0;
       return;
     }
@@ -145,6 +151,7 @@ function main(): void {
     for (const f of fills) {
       if (f.status !== "filled") {
         if (f.side === "buy") pendingBuy.delete(f.symbol);
+        if (f.side === "sell") pendingSell.delete(f.symbol);
         continue;
       }
       const s = st(f.symbol);
@@ -155,6 +162,7 @@ function main(): void {
         s.entryAtr = atr(s);
         s.peak = px;
       } else {
+        pendingSell.delete(f.symbol);
         s.entryPrice = null;
         s.entryAtr = null;
         s.peak = null;
@@ -202,6 +210,7 @@ function main(): void {
       for (const [sym, qtyStr] of held) {
         const s = state.get(sym);
         if (!s || s.closes.length < MIN_BARS) continue;
+        if (pendingSell.has(sym)) continue; // a sell is already on its way
         const close = s.closes[s.closes.length - 1];
         const a = atr(s);
         if (a <= 0) continue;
@@ -215,6 +224,7 @@ function main(): void {
         if (fast < slow) exit = true; // trend broken
         if (exit && orders.length < maxOrdersPerBar) {
           orderSeq += 1;
+          pendingSell.add(sym);
           orders.push({
             side: "sell",
             client_id: `s-${seq}-${sym}-${orderSeq}`,
@@ -240,7 +250,7 @@ function main(): void {
           const close = s.closes[s.closes.length - 1];
           const open = toFloat(b.o, priceScale.get(sym) ?? 0);
           const a = atr(s);
-          if (a <= 0 || a / close > 0.08) continue; // skip absurd volatility
+          if (a <= 0 || a / close > 0.1) continue; // skip absurd volatility
           if (close / open > 1.12) continue; // skip one-bar vertical spike
           const fast = ema(s.closes, FAST);
           const slowArr = emaSeries(s.closes, SLOW);
